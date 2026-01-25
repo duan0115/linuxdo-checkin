@@ -176,7 +176,11 @@ class LinuxDoBrowser:
         self.page.get(HOME_URL)
 
         time.sleep(5)
-        user_ele = self.page.ele("@id=current-user")
+        try:
+            user_ele = self.page.ele("@id=current-user")
+        except Exception as e:
+            logger.warning(f"登录验证失败: {str(e)}")
+            return True
         if not user_ele:
             # Fallback check for avatar
             if "avatar" in self.page.html:
