@@ -245,11 +245,11 @@ class LinuxDoBrowser:
         for i, topic in enumerate(topics_to_browse):
             self.click_one_topic(topic.attr("href"))
 
-            # 在中间点获取升级进度
-            if i == mid_point and not self.connect_info:
-                logger.info("浏览中途，获取升级进度...")
-                time.sleep(5)  # 短暂等待
-                self.get_user_progress()
+            # 升级进度 API 已禁用，避免触发 429 速率限制导致封号风险
+            # if i == mid_point and not self.connect_info:
+            #     logger.info("浏览中途，获取升级进度...")
+            #     time.sleep(5)  # 短暂等待
+            #     self.get_user_progress()
 
         return True
 
@@ -325,11 +325,11 @@ class LinuxDoBrowser:
             if browse_success:
                 logger.info("完成浏览任务")
                 self.stats["browse_success"] = True
-                # 如果中途没有获取到升级进度，最后再尝试一次
-                if not self.connect_info:
-                    logger.info("等待 30 秒后获取升级进度...")
-                    time.sleep(30)
-                    self.get_user_progress()
+                # 注意：1级用户无法获取升级进度数据，暂时禁用
+                # if not self.connect_info:
+                #     logger.info("等待 30 秒后获取升级进度...")
+                #     time.sleep(30)
+                #     self.get_user_progress()
 
         # 只有在任务成功时才发送通知
         if task_success and self.stats["browse_count"] > 0:
@@ -344,13 +344,16 @@ class LinuxDoBrowser:
     def click_like(self, page):
         """点赞帖子 - 使用 Discourse Reactions 插件
 
-        HTML结构（来自真实页面）：
-        <div class="discourse-reactions-actions can-toggle-reaction">  <!-- 或 has-reacted -->
-          <div class="discourse-reactions-reaction-button" title="点赞此帖子">
-            <button class="btn btn-toggle-reaction-like" title="点赞此帖子">
+        HTML结构（来自真实页面分析）：
+        已点赞状态:
+          <div class="discourse-reactions-actions has-reacted has-used-main-reaction">
+            <button title="您无法再移除您自己的回应了">
+              <svg class="d-icon-d-liked">  <!-- 实心爱心 -->
 
-        注意：页面有两个 discourse-reactions-actions div（left 和 right），
-        只有 right 那个包含点赞按钮
+        未点赞状态:
+          <div class="discourse-reactions-actions can-toggle-reaction">
+            <button title="点赞此帖子">
+              <svg class="d-icon-d-unliked">  <!-- 空心爱心 -->
         """
         try:
             # 等待页面稳定
@@ -364,8 +367,7 @@ class LinuxDoBrowser:
 
             first_article = articles[0]
 
-            # 查找包含点赞按钮的 actions div（right 那个）
-            # 通过查找包含 button 的 div 来定位正确的容器
+            # 查找包含点赞按钮的 actions div
             actions_divs = first_article.eles('.discourse-reactions-actions')
             right_actions_div = None
             for div in actions_divs:
@@ -386,7 +388,7 @@ class LinuxDoBrowser:
                     logger.info(f"无法点赞此帖子，class: {classes}")
                     return
 
-            # 查找点赞按钮 - 使用多种选择器
+            # 查找点赞按钮
             like_btn = first_article.ele('button.btn-toggle-reaction-like', timeout=1)
             if not like_btn:
                 like_btn = first_article.ele('css:.discourse-reactions-reaction-button button', timeout=0.5)
@@ -394,7 +396,6 @@ class LinuxDoBrowser:
                 like_btn = first_article.ele('css:button.reaction-button', timeout=0.5)
 
             if not like_btn:
-                # 检查是否是未登录状态
                 login_hint = first_article.ele('css:button[title*="登录"]', timeout=0.3)
                 if login_hint or first_article.ele('css:button[title*="注册"]', timeout=0.3):
                     logger.warning("检测到未登录状态，无法点赞（Cookie 可能未正确同步）")
@@ -417,40 +418,80 @@ class LinuxDoBrowser:
                 return
             if btn_title != '点赞此帖子':
                 logger.info(f"按钮状态异常: {btn_title}")
-                # 继续尝试点赞
 
-            # 直接点击按钮进行点赞
+            # 使用 JavaScript 点击，更可靠
             logger.info("点击点赞按钮...")
-            like_btn.click()
+            try:
+                # 方法1: 使用 JavaScript 直接点击
+                page.run_js('arguments[0].click()', like_btn)
+                logger.info("使用 JS 点击成功")
+            except Exception as js_err:
+                logger.info(f"JS 点击失败: {js_err}，尝试原生点击")
+                like_btn.click()
 
-            # 等待页面响应（点赞需要服务器处理）
-            time.sleep(2.0)
+            # 等待服务器响应和 DOM 更新
+            time.sleep(3)
 
-            # 验证点赞是否成功 - 重新查找正确的 actions div
+            # 刷新元素引用后验证（DOM 可能已更新）
             verified = False
-            actions_divs_verify = first_article.eles('.discourse-reactions-actions')
-            for div in actions_divs_verify:
-                if div.ele('button', timeout=0.2):
-                    classes = div.attr('class') or ''
-                    if 'has-reacted' in classes:
-                        logger.info("点赞成功！")
+
+            # 方式1: 重新获取按钮，检查 SVG 图标
+            try:
+                # 重新定位第一个帖子（DOM 可能已变化）
+                articles_new = page.eles('tag:article')
+                if articles_new:
+                    first_article_new = articles_new[0]
+                    liked_icon = first_article_new.ele('css:svg.d-icon-d-liked', timeout=1)
+                    if liked_icon:
+                        logger.info("点赞成功！（通过 d-icon-d-liked 图标验证）")
                         self.stats["like_success"] += 1
                         verified = True
-                    else:
-                        # 检查按钮 title 是否变化
-                        btn = div.ele('button', timeout=0.2)
-                        if btn:
-                            new_title = btn.attr('title') or ''
+            except Exception as e:
+                logger.debug(f"图标验证异常: {e}")
+
+            # 方式2: 检查 actions div 的 has-reacted class
+            if not verified:
+                try:
+                    articles_new = page.eles('tag:article')
+                    if articles_new:
+                        first_article_new = articles_new[0]
+                        actions_divs_new = first_article_new.eles('.discourse-reactions-actions')
+                        for div in actions_divs_new:
+                            if div.ele('button', timeout=0.2):
+                                classes = div.attr('class') or ''
+                                if 'has-reacted' in classes:
+                                    logger.info("点赞成功！（通过 has-reacted class 验证）")
+                                    self.stats["like_success"] += 1
+                                    verified = True
+                                break
+                except Exception as e:
+                    logger.debug(f"class 验证异常: {e}")
+
+            # 方式3: 检查按钮 title 是否变化
+            if not verified:
+                try:
+                    articles_new = page.eles('tag:article')
+                    if articles_new:
+                        first_article_new = articles_new[0]
+                        new_btn = first_article_new.ele('button.btn-toggle-reaction-like', timeout=0.5)
+                        if new_btn:
+                            new_title = new_btn.attr('title') or ''
+                            logger.info(f"点击后按钮 title: {new_title}")
                             if '移除' in new_title or '无法' in new_title:
-                                logger.info("点赞成功！（通过按钮状态验证）")
+                                logger.info("点赞成功！（通过按钮 title 验证）")
                                 self.stats["like_success"] += 1
                                 verified = True
-                            else:
-                                logger.warning(f"点赞可能未成功，按钮title: {new_title}")
-                    break
+                            elif new_title != '点赞此帖子' and new_title != btn_title:
+                                logger.info(f"点赞可能成功，title 已变化: {new_title}")
+                                self.stats["like_success"] += 1
+                                verified = True
+                except Exception as e:
+                    logger.debug(f"title 验证异常: {e}")
 
             if not verified:
-                logger.warning("无法验证点赞状态（可能已成功但页面未更新）")
+                # 点击执行但无法验证，记录为失败
+                logger.warning("点赞验证失败，点击可能未生效")
+                # 不增加成功计数
 
             time.sleep(random.uniform(1, 2))
 
@@ -629,11 +670,12 @@ class LinuxDoBrowser:
         msg_lines.append(f"├ 📖 浏览：{self.stats['browse_count']} 篇")
 
         # 从 connect_info 获取阅读评论数（已读帖子）
-        read_posts = "0"
-        for item in self.connect_info:
-            if len(item) >= 2 and "已读帖子" in item[0]:
-                read_posts = item[1]
-                break
+        read_posts = "N/A"
+        if self.connect_info:
+            for item in self.connect_info:
+                if len(item) >= 2 and "已读帖子" in item[0]:
+                    read_posts = item[1]
+                    break
         msg_lines.append(f"├ 💬 阅读评论：{read_posts} 条")
         msg_lines.append(f"├ 👍 点赞：{self.stats['like_success']} 次")
         msg_lines.append(f"├ 📝 发帖：0 篇")
@@ -732,9 +774,9 @@ class LinuxDoBrowser:
                 msg_lines.append(progress_bar)
                 msg_lines.append(f"已完成 {completed_count}/{total_count} 项")
         else:
-            # 没有获取到升级进度数据（可能是 API 429）
+            # 没有获取到升级进度数据（1级用户暂无数据或 API 限制）
             msg_lines.append("📈 升级进度：暂无数据")
-            msg_lines.append("（API 速率限制，稍后重试）")
+            msg_lines.append("（1级用户暂不支持获取升级进度）")
 
         return "\n".join(msg_lines)
 
