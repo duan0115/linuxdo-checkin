@@ -165,7 +165,12 @@ class LinuxDoBrowser:
         # Step 3: Pass cookies to DrissionPage
         logger.info("同步 Cookie 到 DrissionPage...")
 
+        # 先访问页面，确保域名正确
+        self.page.get("https://linux.do/")
+        time.sleep(2)
+
         cookies_dict = self.session.cookies.get_dict()
+        logger.info(f"获取到 {len(cookies_dict)} 个 Cookie")
 
         dp_cookies = []
         for name, value in cookies_dict.items():
@@ -180,25 +185,72 @@ class LinuxDoBrowser:
 
         self.page.set.cookies(dp_cookies)
 
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-
-        # 等待页面加载
+        # 刷新页面使 Cookie 生效
+        logger.info("刷新页面使 Cookie 生效...")
+        self.page.refresh()
         time.sleep(5)
 
-        # API 登录已成功，直接返回 True
-        # 不再依赖页面元素验证，因为无头浏览器环境可能无法正确检测
+        # 导航到 /latest 页面
+        logger.info("导航至 linux.do/latest...")
+        self.page.get("https://linux.do/latest")
+
+        # 等待页面加载（代理环境下可能需要更长时间）
+        logger.info("等待页面加载...")
+        time.sleep(10)
+
+        # 验证登录状态
+        login_btn = self.page.ele('css:button.login-button', timeout=2)
+        if login_btn:
+            logger.warning("检测到登录按钮，Cookie 可能未正确同步，尝试再次刷新...")
+            self.page.refresh()
+            time.sleep(5)
+
         logger.info("Cookie 已设置，继续执行任务...")
         return True
 
     def click_topic(self):
-        topic_list = self.page.ele("@id=list-area").eles(".:title")
+        # 等待页面加载完成
+        time.sleep(2)
+
+        # 使用多种选择器尝试获取帖子链接
+        # 方法1：使用 class 选择器（最可靠）
+        topic_list = self.page.eles('css:a.title.raw-topic-link')
+        if not topic_list:
+            # 方法2：使用 span.link-top-line 下的链接
+            topic_list = self.page.eles('css:span.link-top-line > a')
+        if not topic_list:
+            # 方法3：使用 #list-area 下的链接（原方法）
+            list_area = self.page.ele('@id=list-area', timeout=5)
+            if list_area:
+                topic_list = list_area.eles('css:a.title')
+        if not topic_list:
+            # 方法4：备用 - 获取所有帖子链接
+            all_links = self.page.eles('css:a[href^="/t/topic/"]')
+            # 过滤：只保留标题链接（href 不包含 /数字 结尾的回复链接）
+            topic_list = [t for t in all_links if not re.search(r'/\d+$', t.attr("href") or "")]
+
         if not topic_list:
             logger.error("未找到主题帖")
             return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
+
+        # 过滤掉置顶帖（前3个通常是置顶的公告帖）
+        if len(topic_list) > 3:
+            topic_list = topic_list[3:]
+        sample_count = min(10, len(topic_list))
+        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择 {sample_count} 个")
+        topics_to_browse = random.sample(topic_list, sample_count)
+
+        # 在浏览到一半时获取升级进度（分散请求，避免429）
+        mid_point = len(topics_to_browse) // 2
+        for i, topic in enumerate(topics_to_browse):
             self.click_one_topic(topic.attr("href"))
+
+            # 在中间点获取升级进度
+            if i == mid_point and not self.connect_info:
+                logger.info("浏览中途，获取升级进度...")
+                time.sleep(5)  # 短暂等待
+                self.get_user_progress()
+
         return True
 
     @retry_decorator()
@@ -273,8 +325,11 @@ class LinuxDoBrowser:
             if browse_success:
                 logger.info("完成浏览任务")
                 self.stats["browse_success"] = True
-                # 浏览任务完成后再获取升级进度（此时距离登录已过去几分钟）
-                self.get_user_progress()
+                # 如果中途没有获取到升级进度，最后再尝试一次
+                if not self.connect_info:
+                    logger.info("等待 30 秒后获取升级进度...")
+                    time.sleep(30)
+                    self.get_user_progress()
 
         # 只有在任务成功时才发送通知
         if task_success and self.stats["browse_count"] > 0:
@@ -289,194 +344,113 @@ class LinuxDoBrowser:
     def click_like(self, page):
         """点赞帖子 - 使用 Discourse Reactions 插件
 
-        linux.do 使用 Discourse Reactions 插件，点赞流程：
-        1. 悬停在点赞按钮上会弹出表情选择面板
-        2. 点击表情（如❤️）完成点赞
-        3. 或者直接点击按钮会使用默认表情
+        HTML结构（来自真实页面）：
+        <div class="discourse-reactions-actions can-toggle-reaction">  <!-- 或 has-reacted -->
+          <div class="discourse-reactions-reaction-button" title="点赞此帖子">
+            <button class="btn btn-toggle-reaction-like" title="点赞此帖子">
+
+        注意：页面有两个 discourse-reactions-actions div（left 和 right），
+        只有 right 那个包含点赞按钮
         """
         try:
             # 等待页面稳定
             time.sleep(1.5)
 
-            # 获取第一个帖子的点赞状态和按钮信息
-            like_info = page.run_js("""
-                // 获取第一个帖子的 reactions 区域
-                const articles = document.querySelectorAll('article');
-                if (articles.length === 0) return { error: 'no_articles' };
+            # 使用 DrissionPage 定位第一个帖子
+            articles = page.eles('tag:article')
+            if not articles:
+                logger.info("未找到帖子")
+                return
 
-                const firstArticle = articles[0];
-                const nav = firstArticle.querySelector('nav.post-controls');
-                if (!nav) return { error: 'no_nav' };
+            first_article = articles[0]
 
-                // 找到点赞按钮区域
-                const reactionBtn = nav.querySelector('.discourse-reactions-reaction-button');
-                const btn = nav.querySelector('button.btn-toggle-reaction-like');
+            # 查找包含点赞按钮的 actions div（right 那个）
+            # 通过查找包含 button 的 div 来定位正确的容器
+            actions_divs = first_article.eles('.discourse-reactions-actions')
+            right_actions_div = None
+            for div in actions_divs:
+                if div.ele('button', timeout=0.2):
+                    right_actions_div = div
+                    break
 
-                if (!btn) return { error: 'no_button' };
+            if right_actions_div:
+                classes = right_actions_div.attr('class') or ''
 
-                const title = btn.getAttribute('title') || '';
-                const actionsDiv = nav.querySelector('.discourse-reactions-actions[id*="right"]') ||
-                                   btn.closest('.discourse-reactions-actions');
-
-                // 检查状态
-                const hasReacted = actionsDiv && actionsDiv.classList.contains('has-reacted');
-                const isOwnPost = title.includes('自己') || title.includes('own');
-                const needLogin = title.includes('登录') || title.includes('注册');
-
-                return {
-                    hasReacted: hasReacted,
-                    isOwnPost: isOwnPost,
-                    needLogin: needLogin,
-                    title: title,
-                    btnExists: !!btn,
-                    reactionBtnExists: !!reactionBtn
-                };
-            """)
-
-            if isinstance(like_info, dict):
-                if like_info.get('error'):
-                    logger.info(f"未找到点赞区域: {like_info.get('error')}")
-                    return
-
-                if like_info.get('needLogin'):
-                    logger.info("需要登录才能点赞")
-                    return
-
-                if like_info.get('hasReacted'):
+                # 检查是否已点赞
+                if 'has-reacted' in classes:
                     logger.info("帖子已经点过赞了，跳过")
                     return
 
-                if like_info.get('isOwnPost'):
-                    logger.info("无法给自己的帖子点赞")
+                # 检查是否可以点赞
+                if 'can-toggle-reaction' not in classes:
+                    logger.info(f"无法点赞此帖子，class: {classes}")
                     return
 
-            # 方法1: 尝试悬停触发表情面板，然后点击表情
-            hover_result = page.run_js("""
-                const articles = document.querySelectorAll('article');
-                if (articles.length === 0) return { error: 'no_articles' };
+            # 查找点赞按钮 - 使用多种选择器
+            like_btn = first_article.ele('button.btn-toggle-reaction-like', timeout=1)
+            if not like_btn:
+                like_btn = first_article.ele('css:.discourse-reactions-reaction-button button', timeout=0.5)
+            if not like_btn:
+                like_btn = first_article.ele('css:button.reaction-button', timeout=0.5)
 
-                const firstArticle = articles[0];
-                const reactionBtn = firstArticle.querySelector('.discourse-reactions-reaction-button');
-
-                if (reactionBtn) {
-                    // 触发 mouseenter 事件来显示表情面板
-                    const mouseEnter = new MouseEvent('mouseenter', {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window
-                    });
-                    reactionBtn.dispatchEvent(mouseEnter);
-                    return { hovered: true };
-                }
-                return { error: 'no_reaction_btn' };
-            """)
-
-            if hover_result.get('hovered'):
-                logger.info("已悬停在点赞按钮上")
-                time.sleep(0.8)  # 等待表情面板出现
-
-                # 检查表情面板是否出现并点击表情
-                emoji_click = page.run_js("""
-                    // 查找表情面板
-                    const picker = document.querySelector('.discourse-reactions-picker');
-                    if (picker) {
-                        const style = window.getComputedStyle(picker);
-                        if (style.display !== 'none' && style.visibility !== 'hidden') {
-                            // 面板可见，查找表情
-                            const emojis = picker.querySelectorAll('.pickable-reaction, img.emoji');
-                            if (emojis.length > 0) {
-                                emojis[0].click();  // 点击第一个表情（通常是❤️）
-                                return { clicked: true, method: 'picker_emoji' };
-                            }
-                        }
-                    }
-                    return { visible: false };
-                """)
-
-                if emoji_click.get('clicked'):
-                    logger.info("已通过表情面板点赞")
-                    time.sleep(0.5)
+            if not like_btn:
+                # 检查是否是未登录状态
+                login_hint = first_article.ele('css:button[title*="登录"]', timeout=0.3)
+                if login_hint or first_article.ele('css:button[title*="注册"]', timeout=0.3):
+                    logger.warning("检测到未登录状态，无法点赞（Cookie 可能未正确同步）")
                 else:
-                    # 表情面板没出现，直接点击按钮
-                    logger.info("表情面板未出现，直接点击按钮")
-                    page.run_js("""
-                        const articles = document.querySelectorAll('article');
-                        if (articles.length > 0) {
-                            const btn = articles[0].querySelector('button.btn-toggle-reaction-like');
-                            if (btn) btn.click();
-                        }
-                    """)
-                    time.sleep(0.8)
+                    logger.info("未找到点赞按钮")
+                return
 
-                    # 再次检查是否弹出表情面板
-                    retry_emoji = page.run_js("""
-                        const picker = document.querySelector('.discourse-reactions-picker');
-                        if (picker) {
-                            const style = window.getComputedStyle(picker);
-                            if (style.display !== 'none' && style.visibility !== 'hidden') {
-                                const emojis = picker.querySelectorAll('.pickable-reaction, img.emoji');
-                                if (emojis.length > 0) {
-                                    emojis[0].click();
-                                    return { clicked: true };
-                                }
-                            }
-                        }
-                        return { clicked: false };
-                    """)
+            # 检查按钮状态
+            btn_title = like_btn.attr('title') or ''
+            logger.info(f"点赞按钮 title: {btn_title}")
 
-                    if retry_emoji.get('clicked'):
-                        logger.info("已选择表情")
-                        time.sleep(0.5)
-            else:
-                # 悬停失败，直接点击按钮
-                logger.info("悬停失败，直接点击点赞按钮")
-                page.run_js("""
-                    const articles = document.querySelectorAll('article');
-                    if (articles.length > 0) {
-                        const btn = articles[0].querySelector('button.btn-toggle-reaction-like');
-                        if (btn) btn.click();
-                    }
-                """)
-                time.sleep(1.0)
+            if '登录' in btn_title or '注册' in btn_title:
+                logger.warning("需要登录才能点赞（Cookie 可能未正确同步）")
+                return
+            if '自己' in btn_title:
+                logger.info("无法给自己的帖子点赞")
+                return
+            if '移除' in btn_title or '无法' in btn_title:
+                logger.info("帖子已点赞或无法操作")
+                return
+            if btn_title != '点赞此帖子':
+                logger.info(f"按钮状态异常: {btn_title}")
+                # 继续尝试点赞
 
-            # 验证点赞是否成功
-            time.sleep(0.8)
-            verify_result = page.run_js("""
-                const articles = document.querySelectorAll('article');
-                if (articles.length === 0) return { success: false, error: 'no_articles' };
+            # 直接点击按钮进行点赞
+            logger.info("点击点赞按钮...")
+            like_btn.click()
 
-                const firstArticle = articles[0];
-                const actionsDiv = firstArticle.querySelector('.discourse-reactions-actions[id*="right"]');
+            # 等待页面响应（点赞需要服务器处理）
+            time.sleep(2.0)
 
-                if (actionsDiv) {
-                    const hasReacted = actionsDiv.classList.contains('has-reacted');
-                    // 也检查按钮的 SVG 是否变成实心心形
-                    const btn = actionsDiv.querySelector('button.btn-toggle-reaction-like');
-                    const svg = btn ? btn.querySelector('svg use') : null;
-                    const isFilled = svg && svg.getAttribute('href') && svg.getAttribute('href').includes('heart') && !svg.getAttribute('href').includes('far-');
+            # 验证点赞是否成功 - 重新查找正确的 actions div
+            verified = False
+            actions_divs_verify = first_article.eles('.discourse-reactions-actions')
+            for div in actions_divs_verify:
+                if div.ele('button', timeout=0.2):
+                    classes = div.attr('class') or ''
+                    if 'has-reacted' in classes:
+                        logger.info("点赞成功！")
+                        self.stats["like_success"] += 1
+                        verified = True
+                    else:
+                        # 检查按钮 title 是否变化
+                        btn = div.ele('button', timeout=0.2)
+                        if btn:
+                            new_title = btn.attr('title') or ''
+                            if '移除' in new_title or '无法' in new_title:
+                                logger.info("点赞成功！（通过按钮状态验证）")
+                                self.stats["like_success"] += 1
+                                verified = True
+                            else:
+                                logger.warning(f"点赞可能未成功，按钮title: {new_title}")
+                    break
 
-                    return {
-                        success: hasReacted || isFilled,
-                        hasReacted: hasReacted,
-                        classes: actionsDiv.className
-                    };
-                }
-
-                // 备用检查
-                const btn = firstArticle.querySelector('button.btn-toggle-reaction-like');
-                if (btn) {
-                    const hasUsed = btn.classList.contains('has-used') || btn.classList.contains('my-reaction');
-                    return { success: hasUsed, method: 'btn_class' };
-                }
-
-                return { success: false, error: 'verification_failed' };
-            """)
-
-            if verify_result.get('success'):
-                logger.info("点赞成功！")
-                self.stats["like_success"] += 1
-            else:
-                logger.warning(f"点赞可能未成功: {verify_result}")
+            if not verified:
+                logger.warning("无法验证点赞状态（可能已成功但页面未更新）")
 
             time.sleep(random.uniform(1, 2))
 
@@ -506,74 +480,93 @@ class LinuxDoBrowser:
             logger.warning(f"获取用户等级失败: {e}")
 
     def get_user_progress(self):
-        """获取用户升级进度数据 - 浏览任务完成后调用，请求 linux.do API"""
+        """获取用户升级进度数据 - 浏览任务完成后调用，请求 linux.do API
+
+        包含重试机制，遇到 429 会等待后重试
+        """
         logger.info("获取用户升级进度...")
-        try:
-            api_headers = {"Accept": "application/json"}
-            resp_api = self.session.get(
-                f"https://linux.do/u/{USERNAME}.json",
-                headers=api_headers,
-                impersonate="chrome136"
-            )
 
-            if resp_api.status_code == 200:
-                user_data = resp_api.json()
-                user = user_data.get("user", {})
+        max_retries = 3
+        retry_delays = [60, 120, 180]  # 重试等待时间：1分钟、2分钟、3分钟
 
-                # 构建 connect_info 数据
-                info = []
+        for attempt in range(max_retries):
+            try:
+                api_headers = {"Accept": "application/json"}
+                resp_api = self.session.get(
+                    f"https://linux.do/u/{USERNAME}.json",
+                    headers=api_headers,
+                    impersonate="chrome136"
+                )
 
-                # 从 API 获取的数据
-                days_visited = user.get("days_visited", 0)
-                posts_read_count = user.get("posts_read_count", 0)
-                topics_entered = user.get("topics_entered", 0)
-                likes_given = user.get("likes_given", 0)
-                likes_received = user.get("likes_received", 0)
-                topic_count = user.get("topic_count", 0)
-                post_count = user.get("post_count", 0)
-                time_read = user.get("time_read", 0)  # 秒
+                if resp_api.status_code == 200:
+                    user_data = resp_api.json()
+                    user = user_data.get("user", {})
 
-                # 转换阅读时间为分钟
-                time_read_minutes = time_read // 60 if time_read else 0
+                    # 构建 connect_info 数据
+                    info = []
 
-                # 根据当前等级设置升级要求 (1级升2级的要求)
-                if self.user_level == 0:
-                    requirements = {
-                        "访问天数": 5, "浏览的话题": 10, "已读帖子": 50,
-                        "阅读时间": 30, "点赞": 0, "获赞": 0, "回复的话题": 0
-                    }
-                elif self.user_level == 1:
-                    requirements = {
-                        "访问天数": 15, "浏览的话题": 20, "已读帖子": 100,
-                        "阅读时间": 60, "点赞": 1, "获赞": 1, "回复的话题": 3
-                    }
-                elif self.user_level == 2:
-                    requirements = {
-                        "访问天数": 50, "浏览的话题": 100, "已读帖子": 500,
-                        "阅读时间": 120, "点赞": 20, "获赞": 10, "回复的话题": 10
-                    }
+                    # 从 API 获取的数据
+                    days_visited = user.get("days_visited", 0)
+                    posts_read_count = user.get("posts_read_count", 0)
+                    topics_entered = user.get("topics_entered", 0)
+                    likes_given = user.get("likes_given", 0)
+                    likes_received = user.get("likes_received", 0)
+                    topic_count = user.get("topic_count", 0)
+                    post_count = user.get("post_count", 0)
+                    time_read = user.get("time_read", 0)  # 秒
+
+                    # 转换阅读时间为分钟
+                    time_read_minutes = time_read // 60 if time_read else 0
+
+                    # 根据当前等级设置升级要求 (1级升2级的要求)
+                    if self.user_level == 0:
+                        requirements = {
+                            "访问天数": 5, "浏览的话题": 10, "已读帖子": 50,
+                            "阅读时间": 30, "点赞": 0, "获赞": 0, "回复的话题": 0
+                        }
+                    elif self.user_level == 1:
+                        requirements = {
+                            "访问天数": 15, "浏览的话题": 20, "已读帖子": 100,
+                            "阅读时间": 60, "点赞": 1, "获赞": 1, "回复的话题": 3
+                        }
+                    elif self.user_level == 2:
+                        requirements = {
+                            "访问天数": 50, "浏览的话题": 100, "已读帖子": 500,
+                            "阅读时间": 120, "点赞": 20, "获赞": 10, "回复的话题": 10
+                        }
+                    else:
+                        requirements = {}
+
+                    # 构建数据
+                    info.append(["访问天数", str(days_visited), str(requirements.get("访问天数", 0))])
+                    info.append(["点赞", str(likes_given), str(requirements.get("点赞", 0))])
+                    info.append(["获赞", str(likes_received), str(requirements.get("获赞", 0))])
+                    info.append(["回复的话题", str(post_count), str(requirements.get("回复的话题", 0))])
+                    info.append(["浏览的话题", str(topics_entered), str(requirements.get("浏览的话题", 0))])
+                    info.append(["已读帖子", str(posts_read_count), str(requirements.get("已读帖子", 0))])
+                    info.append(["阅读时间", str(time_read_minutes), str(requirements.get("阅读时间", 0))])
+
+                    self.connect_info = info
+                    logger.info(f"获取到 {len(info)} 条用户数据")
+
+                    print("--------------Connect Info-----------------")
+                    print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+                    return  # 成功，退出函数
+
+                elif resp_api.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delays[attempt]
+                        logger.warning(f"获取用户 API 失败: 429 (速率限制)，等待 {wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.warning(f"获取用户 API 失败: 429 (已重试 {max_retries} 次)")
                 else:
-                    requirements = {}
+                    logger.warning(f"获取用户 API 失败: {resp_api.status_code}")
+                    return  # 非 429 错误，不重试
 
-                # 构建数据
-                info.append(["访问天数", str(days_visited), str(requirements.get("访问天数", 0))])
-                info.append(["点赞", str(likes_given), str(requirements.get("点赞", 0))])
-                info.append(["获赞", str(likes_received), str(requirements.get("获赞", 0))])
-                info.append(["回复的话题", str(post_count), str(requirements.get("回复的话题", 0))])
-                info.append(["浏览的话题", str(topics_entered), str(requirements.get("浏览的话题", 0))])
-                info.append(["已读帖子", str(posts_read_count), str(requirements.get("已读帖子", 0))])
-                info.append(["阅读时间", str(time_read_minutes), str(requirements.get("阅读时间", 0))])
-
-                self.connect_info = info
-                logger.info(f"获取到 {len(info)} 条用户数据")
-
-                print("--------------Connect Info-----------------")
-                print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-            else:
-                logger.warning(f"获取用户 API 失败: {resp_api.status_code}")
-
-        except Exception as e:
-            logger.error(f"获取用户摘要失败: {e}")
+            except Exception as e:
+                logger.error(f"获取用户摘要失败: {e}")
+                return
 
     def get_user_level(self):
         """获取用户当前等级"""
@@ -738,6 +731,10 @@ class LinuxDoBrowser:
                 msg_lines.append(f"🎯 完成度 {completion_rate}%")
                 msg_lines.append(progress_bar)
                 msg_lines.append(f"已完成 {completed_count}/{total_count} 项")
+        else:
+            # 没有获取到升级进度数据（可能是 API 429）
+            msg_lines.append("📈 升级进度：暂无数据")
+            msg_lines.append("（API 速率限制，稍后重试）")
 
         return "\n".join(msg_lines)
 
