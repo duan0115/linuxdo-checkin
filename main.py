@@ -405,7 +405,9 @@ class LinuxDoBrowser:
 
             # 检查按钮状态
             btn_title = like_btn.attr('title') or ''
-            logger.info(f"点赞按钮 title: {btn_title}")
+            btn_tag = like_btn.tag
+            btn_class = like_btn.attr('class') or ''
+            logger.info(f"点赞按钮 tag:{btn_tag} class:{btn_class} title:{btn_title}")
 
             if '登录' in btn_title or '注册' in btn_title:
                 logger.warning("需要登录才能点赞（Cookie 可能未正确同步）")
@@ -419,79 +421,42 @@ class LinuxDoBrowser:
             if btn_title != '点赞此帖子':
                 logger.info(f"按钮状态异常: {btn_title}")
 
-            # 使用 JavaScript 点击，更可靠
+            # 直接点击爱心按钮即可点赞
             logger.info("点击点赞按钮...")
-            try:
-                # 方法1: 使用 JavaScript 直接点击
-                page.run_js('arguments[0].click()', like_btn)
-                logger.info("使用 JS 点击成功")
-            except Exception as js_err:
-                logger.info(f"JS 点击失败: {js_err}，尝试原生点击")
-                like_btn.click()
 
-            # 等待服务器响应和 DOM 更新
-            time.sleep(3)
+            # 使用 DrissionPage 原生点击（CDP 协议级别）
+            like_btn.click()
+            logger.info("点击完成，等待响应...")
 
-            # 刷新元素引用后验证（DOM 可能已更新）
+            # 等待服务器响应
+            time.sleep(2.5)
+
+            # 验证点赞结果
+            logger.info("开始验证点赞结果...")
             verified = False
 
-            # 方式1: 重新获取按钮，检查 SVG 图标
-            try:
-                # 重新定位第一个帖子（DOM 可能已变化）
-                articles_new = page.eles('tag:article')
-                if articles_new:
-                    first_article_new = articles_new[0]
-                    liked_icon = first_article_new.ele('css:svg.d-icon-d-liked', timeout=1)
-                    if liked_icon:
-                        logger.info("点赞成功！（通过 d-icon-d-liked 图标验证）")
-                        self.stats["like_success"] += 1
-                        verified = True
-            except Exception as e:
-                logger.debug(f"图标验证异常: {e}")
+            # 在页面中查找所有点赞按钮，检查是否有已点赞状态
+            all_like_btns = page.eles('button.btn-toggle-reaction-like')
+            logger.info(f"找到 {len(all_like_btns)} 个点赞按钮")
 
-            # 方式2: 检查 actions div 的 has-reacted class
-            if not verified:
-                try:
-                    articles_new = page.eles('tag:article')
-                    if articles_new:
-                        first_article_new = articles_new[0]
-                        actions_divs_new = first_article_new.eles('.discourse-reactions-actions')
-                        for div in actions_divs_new:
-                            if div.ele('button', timeout=0.2):
-                                classes = div.attr('class') or ''
-                                if 'has-reacted' in classes:
-                                    logger.info("点赞成功！（通过 has-reacted class 验证）")
-                                    self.stats["like_success"] += 1
-                                    verified = True
-                                break
-                except Exception as e:
-                    logger.debug(f"class 验证异常: {e}")
-
-            # 方式3: 检查按钮 title 是否变化
-            if not verified:
-                try:
-                    articles_new = page.eles('tag:article')
-                    if articles_new:
-                        first_article_new = articles_new[0]
-                        new_btn = first_article_new.ele('button.btn-toggle-reaction-like', timeout=0.5)
-                        if new_btn:
-                            new_title = new_btn.attr('title') or ''
-                            logger.info(f"点击后按钮 title: {new_title}")
-                            if '移除' in new_title or '无法' in new_title:
-                                logger.info("点赞成功！（通过按钮 title 验证）")
-                                self.stats["like_success"] += 1
-                                verified = True
-                            elif new_title != '点赞此帖子' and new_title != btn_title:
-                                logger.info(f"点赞可能成功，title 已变化: {new_title}")
-                                self.stats["like_success"] += 1
-                                verified = True
-                except Exception as e:
-                    logger.debug(f"title 验证异常: {e}")
+            for btn in all_like_btns:
+                btn_title = btn.attr('title') or ''
+                if '移除' in btn_title or '无法' in btn_title:
+                    logger.info(f"点赞成功！按钮 title: {btn_title}")
+                    self.stats["like_success"] += 1
+                    verified = True
+                    break
 
             if not verified:
-                # 点击执行但无法验证，记录为失败
-                logger.warning("点赞验证失败，点击可能未生效")
-                # 不增加成功计数
+                # 检查第一个按钮的状态
+                if all_like_btns:
+                    first_btn_title = all_like_btns[0].attr('title') or ''
+                    logger.warning(f"点击未生效，第一个按钮 title: {first_btn_title}")
+                else:
+                    logger.warning("未找到任何点赞按钮")
+
+            if not verified:
+                logger.warning("点赞验证失败")
 
             time.sleep(random.uniform(1, 2))
 
