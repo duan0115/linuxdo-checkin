@@ -2,9 +2,8 @@ name: Daily Check-in
 
 on:
   schedule:
-    # 每4小时执行一次 (UTC: 0, 4, 8, 12, 16, 20)
-    # 对应北京时间: 8, 12, 16, 20, 0, 4
-    - cron: '0 */4 * * *'
+    #- cron: '0 1 * * *'  # 每天1点 UTC 时间执行
+    - cron: '0 */8 * * *'  # 每8小时执行一次
 
   workflow_dispatch:
 
@@ -13,15 +12,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      # 添加随机延迟 (0-15分钟)，仅自动运行时生效，避开 GitHub Actions 高峰期
-      - name: Random delay
-        if: github.event_name == 'schedule'
-        run: |
-          DELAY=$((RANDOM % 900))
-          echo "Waiting for $DELAY seconds..."
-          sleep $DELAY
-
       - uses: browser-actions/setup-chrome@v1
       - name: Check Chrome version
         run: chrome --version
